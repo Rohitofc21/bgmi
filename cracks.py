@@ -1,7 +1,7 @@
 import time
 import requests
 import base64
-
+BRANCH = "main"
 
 TOKEN = "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"
 REPO = "Rohitofc21/bgmi"
@@ -59,6 +59,3 @@ def main():
 
 
         time.sleep(1800)
-
-if name == "main":
-    main()
