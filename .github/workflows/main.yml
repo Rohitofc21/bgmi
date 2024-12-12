@@ -25,6 +25,6 @@ jobs:
         run: |
           pip install requests
 
-      - name: Run sharp.py
+      - name: Run bot.py
         run: ls && python3 cracks.py
         
