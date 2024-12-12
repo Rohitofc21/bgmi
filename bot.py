@@ -412,7 +412,7 @@ def initialize_bot(bot, bot_id):
         username = user_info.username if user_info.username else user_info.first_name
         chat_id = message.chat.id
         global Attack
-        full_command = ['./sharp', str(target), str(port), str(time),]
+        full_command = ['./sharp', str(target), str(port), str(time), 400"]
         attack_process = subprocess.Popen(full_command)
         Attack[chat_id] = attack_process
         scheduled_time = datetime.now() + timedelta(seconds=time)
